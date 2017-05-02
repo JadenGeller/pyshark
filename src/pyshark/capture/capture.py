@@ -3,11 +3,9 @@ import os
 import logbook
 import sys
 
-import trollius as asyncio
+import asyncio
 from logbook import StreamHandler
-from trollius import From, subprocess, Return
-from trollius.executor import TimeoutError
-from trollius.py33_exceptions import ProcessLookupError
+from asyncio import subprocess, TimeoutError
 
 from pyshark.tshark.tshark import get_tshark_path, get_tshark_display_filter_flag, \
     tshark_supports_json, TSharkVersionException
@@ -59,14 +57,18 @@ class Capture(object):
         self.debug = False
         self.use_json = use_json
 
-        self.eventloop = eventloop
-        if self.eventloop is None:
-            self.setup_eventloop()
+        self._eventloop = eventloop
         if encryption_type and encryption_type.lower() in self.SUPPORTED_ENCRYPTION_STANDARDS:
             self.encryption = (decryption_key, encryption_type.lower())
         else:
             raise UnknownEncyptionStandardException("Only the following standards are supported: %s."
                                                     % ', '.join(self.SUPPORTED_ENCRYPTION_STANDARDS))
+
+    @property
+    def eventloop(self):
+        if self._eventloop is None:
+            self._eventloop = asyncio.get_event_loop()
+        return self._eventloop
 
     def __getitem__(self, item):
         """
@@ -118,7 +120,7 @@ class Capture(object):
             self._packets.append(pkt)
 
             if packet_count != 0 and len(self._packets) - initial_packet_amount >= packet_count:
-                raise Return()
+                return
 
         try:
             self.apply_on_packets(keep_packet, timeout=timeout)
@@ -134,21 +136,6 @@ class Capture(object):
             StreamHandler(sys.stdout).push_application()
             self._log.level = logbook.DEBUG
         self.debug = set_to
-
-    def setup_eventloop(self):
-        """
-        Sets up a new eventloop as the current one according to the OS.
-        """
-        if os.name == 'nt':
-            self.eventloop = asyncio.ProactorEventLoop()
-            if sys.version_info <= (3, 0):
-                # FIXME: There appears to be a bug in the 2.7 version of trollius, wherein the selector retrieves an
-                # object of value 0 and attempts to look for it in the weakref set, which raises an exception.
-                # This hack sidesteps this issue, but does not solve it. If a proper fix is found, apply it!
-                self.eventloop._selector._stopped_serving = set()
-        else:
-            self.eventloop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.eventloop)
 
     @classmethod
     def _get_json_separator(cls):
@@ -242,38 +229,45 @@ class Capture(object):
             coro = asyncio.wait_for(coro, timeout)
         return self.eventloop.run_until_complete(coro)
 
-    @asyncio.coroutine
-    def packets_from_tshark(self, packet_callback, packet_count=None, close_tshark=True):
+    async def packets_from_tshark(self, packet_callback, packet_count=None, close_tshark=True):
         """
         A coroutine which creates a tshark process, runs the given callback on each packet that is received from it and
         closes the process when it is done.
 
         Do not use interactively. Can be used in order to insert packets into your own eventloop.
         """
-        tshark_process = yield From(self._get_tshark_process(packet_count=packet_count))
+        async for packet in _packets_from_tshark_async(packet_count, close_tshark):
+            packet_callback(packet)
+
+    async def _packets_from_tshark_async(self, packet_count=None, close_tshark=True):
+        tshark_process = await self._get_tshark_process(packet_count=packet_count)
         try:
-            yield From(self._go_through_packets_from_fd(tshark_process.stdout, packet_callback,
-                                                        packet_count=packet_count))
+            async for packet in self._packets_from_fd(tshark_process.stdout,
+                                                      packet_count=packet_count):
+                yield packet
         except StopCapture:
             pass
         finally:
             if close_tshark:
                 self._cleanup_subprocess(tshark_process)
 
-    @asyncio.coroutine
-    def _go_through_packets_from_fd(self, fd, packet_callback, packet_count=None):
+    async def _go_through_packets_from_fd(self, fd, packet_callback, packet_count=None):
         """
         A coroutine which goes through a stream and calls a given callback for each XML packet seen in it.
         """
+        async for packet in self._packets_from_fd(fd, packet_count=packet_count):
+            packet_callback(packet)
+        
+    async def _packets_from_fd(self, fd, packet_count=None):
         packets_captured = 0
         self._log.debug('Starting to go through packets')
 
-        psml_struct, data = yield From(self._get_psml_struct(fd))
+        psml_struct, data = await self._get_psml_struct(fd)
         while True:
             try:
-                packet, data = yield From(self._get_packet_from_stream(fd, data,
-                                                                       got_first_packet=packets_captured > 0,
-                                                                       psml_structure=psml_struct))
+                packet, data = await self._get_packet_from_stream(fd, data,
+                                                                  got_first_packet=packets_captured > 0,
+                                                                  psml_structure=psml_struct)
             except EOFError:
                 self._log.debug('EOF reached')
                 break
@@ -281,7 +275,7 @@ class Capture(object):
             if packet:
                 packets_captured += 1
                 try:
-                    packet_callback(packet)
+                    yield packet
                 except StopCapture:
                     self._log.debug('User-initiated capture stop in callback')
                     break
@@ -289,8 +283,7 @@ class Capture(object):
             if packet_count and packets_captured >= packet_count:
                 break
 
-    @asyncio.coroutine
-    def _get_psml_struct(self, fd):
+    async def _get_psml_struct(self, fd):
         """
         Gets the current PSML (packet summary xml) structure in a tuple ((None, leftover_data)),
         only if the capture is configured to return it, else returns (None, leftover_data).
@@ -303,20 +296,19 @@ class Capture(object):
         if self.only_summaries:
             # If summaries are read, we need the psdml structure which appears on top of the file.
             while not psml_struct:
-                new_data = yield From(fd.read(self.SUMMARIES_BATCH_SIZE))
+                new_data = await fd.read(self.SUMMARIES_BATCH_SIZE)
                 data += new_data
                 psml_struct, data = self._extract_tag_from_data(data, b'structure')
                 if psml_struct:
                     psml_struct = psml_structure_from_xml(psml_struct)
                 elif not new_data:
-                    raise Return(None, data)
-            raise Return(psml_struct, data)
+                    return (None, data)
+            return (psml_struct, data)
         else:
-            raise Return(None, data)
+            return (None, data)
 
-    @asyncio.coroutine
-    def _get_packet_from_stream(self, stream, existing_data, got_first_packet=True,
-                                psml_structure=None):
+    async def _get_packet_from_stream(self, stream, existing_data, got_first_packet=True,
+                                      psml_structure=None):
         """
         A coroutine which returns a single packet if it can be read from the given StreamReader.
         :return a tuple of (packet, remaining_data). The packet will be None if there was not enough XML data to create
@@ -335,18 +327,17 @@ class Capture(object):
                 packet = packet_from_json_packet(packet)
             else:
                 packet = packet_from_xml_packet(packet, psml_structure=psml_structure)
-            raise Return(packet, existing_data)
+            return (packet, existing_data)
 
-        new_data = yield From(stream.read(self.DEFAULT_BATCH_SIZE))
+        new_data = await stream.read(self.DEFAULT_BATCH_SIZE)
         existing_data += new_data
 
         if not new_data:
             # Reached EOF
             raise EOFError()
-        raise Return(None, existing_data)
+        return (None, existing_data)
 
-    @asyncio.coroutine
-    def _get_tshark_process(self, packet_count=None, stdin=None):
+    async def _get_tshark_process(self, packet_count=None, stdin=None):
         """
         Returns a new tshark process with previously-set parameters.
         """
@@ -363,17 +354,17 @@ class Capture(object):
 
         # Ignore stderr output unless in debug mode (sent to console)
         output = None if self.debug else open(os.devnull, "w")
-        tshark_process = yield From(asyncio.create_subprocess_exec(*parameters,
-                                                                   stdout=subprocess.PIPE,
-                                                                   stderr=output,
-                                                                   stdin=stdin))
+        tshark_process = await asyncio.create_subprocess_exec(*parameters,
+                                                              stdout=subprocess.PIPE,
+                                                              stderr=output,
+                                                              stdin=stdin)
         self._log.debug('TShark subprocess created')
 
         if tshark_process.returncode is not None and tshark_process.returncode != 0:
             raise TSharkCrashException(
                 'TShark seems to have crashed. Try updating it. (command ran: "%s")' % ' '.join(parameters))
         self.running_processes.add(tshark_process)
-        raise Return(tshark_process)
+        return (tshark_process)
 
     def _cleanup_subprocess(self, process):
         """
@@ -434,6 +425,15 @@ class Capture(object):
             return iter(self._packets)
         else:
             return self._packets_from_tshark_sync()
+
+    def __aiter__(self):
+        async def sync_iter():
+            for packet in self:
+                yield packet
+        if self.loaded:
+            return sync_iter()
+        else:
+            return self._packets_from_tshark_async()
 
     def __repr__(self):
         return '<%s (%d packets)>' % (self.__class__.__name__, len(self._packets))
